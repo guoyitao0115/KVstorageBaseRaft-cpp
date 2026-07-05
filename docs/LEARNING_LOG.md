@@ -18,6 +18,7 @@
   - [2026-06-01 · `Raft::AppendEntries1` 被动方处理 AE + 跳跃式回退原理](#2026-06-01--raftappendentries1-被动方处理-ae--跳跃式回退原理)
   - [2026-06-07 · `Persister` 持久化文件读写器](#2026-06-07--persister-持久化文件读写器)
   - [2026-06-07 · `raft.cpp` 持久化链路总览](#2026-06-07--raftcpp-持久化链路总览)
+  - [2026-07-05 · `KvServer` 持久化与状态机快照链路](#2026-07-05--kvserver-持久化与状态机快照链路)
 
 ---
 
@@ -3823,3 +3824,898 @@ snapshot data: KvServer 序列化后的状态机数据
 - [ ] 梳理 `KvServer::MakeSnapShot()` 和 `ReadSnapShotToInstall()` 的具体序列化内容，补一节 KVServer snapshot 日志。
 - [ ] 写一个 Mermaid 图，把 `commit -> apply -> snapshot -> truncate` 的状态流单独画出来。
 
+---
+
+### 2026-07-05 · `KvServer` 持久化与状态机快照链路
+
+- **文件**：`src/raftCore/kvServer.cpp`
+- **头文件**：`src/raftCore/include/kvServer.h`
+- **相关行号**：`kvServer.cpp` 20 ~ 76、166 ~ 207、212 ~ 279、281 ~ 363、377 ~ 450；`kvServer.h` 25 ~ 44、97 ~ 129
+- **关键词**：状态机 / apply / 去重表 / waitApplyCh / snapshot data / Boost.Serialization / Persister / Raft 与 KvServer 分层
+
+#### 代码位置
+
+本节梳理 `KvServer` 中和持久化、快照、去重、apply 通知有关的函数。
+
+先记一个总模型：
+
+```text
+客户端 Clerk
+  -> KvServer 接 RPC
+  -> Raft::Start(op) 复制日志
+  -> Raft commit 后通过 applyChan 推 ApplyMsg
+  -> KvServer apply 到 SkipList
+  -> KvServer 更新客户端去重表
+  -> 必要时生成 snapshot
+```
+
+`KvServer` 不是直接负责落盘文件的类。它负责**状态机内容**：
+
+| 内容 | 变量 | 是否进入 snapshot |
+| --- | --- | --- |
+| KV 数据 | `m_skipList` | ✅ 通过 `m_serializedKVData` |
+| 客户端去重表 | `m_lastRequestId` | ✅ |
+| 等待中的 RPC 通知表 | `waitApplyCh` | ❌ 临时内存状态 |
+| 已安装 snapshot 覆盖到的 Raft index | `m_lastSnapShotRaftLogIndex` | ❌ 当前实现未持久化 |
+
+---
+
+#### 总体关系图
+
+```mermaid
+flowchart TD
+    A[客户端 PutAppend/Get RPC] --> B[KvServer::PutAppend/Get]
+    B --> C[构造 Op<br/>ClientId + RequestId + Key + Value]
+    C --> D[Raft::Start(op)]
+    D --> E[返回 raftIndex<br/>本次命令暂放的日志位置]
+    E --> F[waitApplyCh[raftIndex]<br/>RPC线程等待结果]
+
+    G[Raft 多数派 commit] --> H[Raft::applierTicker]
+    H --> I[applyChan.Push ApplyMsg]
+    I --> J[KvServer::ReadRaftApplyCommandLoop]
+    J -->|CommandValid| K[KvServer::GetCommandFromRaft]
+    K --> L[ifRequestDuplicate 去重检查]
+    L --> M[ExecutePut/Append/Get<br/>写 SkipList 或读 SkipList]
+    M --> N[更新 m_lastRequestId]
+    N --> O[SendMessageToWaitChan<br/>唤醒 waitApplyCh 中等待的 RPC线程]
+
+    K --> P{RaftStateSize 是否过大}
+    P -->|是| Q[KvServer::MakeSnapShot]
+    Q --> R[getSnapshotData<br/>SkipList + 去重表]
+    R --> S[Raft::Snapshot(index, snapshot)]
+    S --> T[Persister::Save<br/>raftstate + snapshot]
+
+    U[Raft::InstallSnapshot] --> V[ApplyMsg Snapshot]
+    V --> J
+    J -->|SnapshotValid| W[KvServer::GetSnapShotFromRaft]
+    W --> X[ReadSnapShotToInstall]
+    X --> Y[parseFromString<br/>恢复 SkipList + 去重表]
+```
+
+---
+
+#### 基础概念回补
+
+##### 1) Server、Raft 节点、状态机是什么关系？
+
+在这个项目里，一个服务端进程里同时有几层：
+
+```text
+一个 server 进程
+  ├── KvServer：对客户端提供 Get/Put/Append 服务
+  ├── Raft 节点：负责选主、日志复制、commit
+  ├── 状态机 SkipList：真正存 key-value
+  ├── applyChan：Raft 通知 KvServer 的队列
+  └── Persister：负责文件读写
+```
+
+所以：
+
+- 客户端只和 `KvServer` 通信。
+- `KvServer` 调本进程里的 `Raft`。
+- `Raft` 和其他 server 里的 `Raft` 节点通信。
+- `Raft` commit 后，`KvServer` 才把命令执行到 `SkipList`。
+
+##### 2) commit 和 apply 有什么区别？
+
+```text
+commit：Raft 认为某条日志已经被多数派复制，可以执行。
+apply：KvServer 真正把这条日志执行到状态机 SkipList。
+```
+
+例子：
+
+```text
+日志内容：Put("x", "100")
+
+commit：
+  多数派节点已经复制了这条日志。
+
+apply：
+  SkipList["x"] = "100"
+```
+
+##### 3) `raftIndex` 为什么叫“预测的位置”？
+
+客户端请求进入 Leader 后，`KvServer` 调：
+
+```cpp
+m_raftNode->Start(op, &raftIndex, &_, &isleader);
+```
+
+`Raft::Start()` 会把命令追加到 Leader 本地日志末尾，index 是：
+
+```text
+当前最后一条日志 index + 1
+```
+
+比如当前最后一条是 14，新请求就放到 15。
+
+但此时它只是 Leader 本地追加，还没复制到多数派，未来可能因为 Leader 切换被覆盖。所以 `raftIndex` 的准确含义是：
+
+```text
+如果这条命令最终成功 commit，它应该出现在这个 index。
+```
+
+因此后面必须检查“这个 index 最终 commit 的是不是我这条命令”。
+
+---
+
+#### 逐函数解读
+
+##### 1) `serialize()`：声明 snapshot 中保存哪些字段（kvServer.h 105-112）
+
+```cpp
+template <class Archive>
+void serialize(Archive &ar, const unsigned int version)
+{
+  ar &m_serializedKVData;
+  ar &m_lastRequestId;
+}
+```
+
+这个函数是 Boost.Serialization 的约定。`ar` 可以理解为“归档器”，也就是 Boost 用来读写对象字段的工具。
+
+同一个 `serialize()` 同时支持写出和读回：
+
+```text
+保存时：ar 是 text_oarchive，ar & 字段 等价于把字段写出去。
+恢复时：ar 是 text_iarchive，ar & 字段 等价于把字段读回来。
+```
+
+真正进入 snapshot 的只有两个字段：
+
+```text
+m_serializedKVData：SkipList 导出的 KV 数据字符串
+m_lastRequestId：客户端去重表
+```
+
+它不是把整个 `KvServer` 的所有成员都保存了。虽然调用处写的是：
+
+```cpp
+oa << *this;
+```
+
+但 Boost 只会处理 `serialize()` 里列出来的字段。
+
+---
+
+##### 2) `getSnapshotData()`：生成 KVServer 的 snapshot 字符串（kvServer.h 114-121）
+
+```cpp
+std::string getSnapshotData() {
+```
+
+返回一个字符串，这个字符串就是 KVServer 的状态机快照内容。
+
+```cpp
+m_serializedKVData = m_skipList.dump_file();
+```
+
+先把当前 SkipList 里的 KV 数据导出成字符串。此时 `m_serializedKVData` 只是临时容器。
+
+```cpp
+std::stringstream ss;
+```
+
+创建字符串流，用来承接 Boost 序列化结果。
+
+```cpp
+boost::archive::text_oarchive oa(ss);
+```
+
+创建文本输出归档器。`oa` 会把对象字段写入 `ss`。
+
+```cpp
+oa << *this;
+```
+
+序列化当前 `KvServer` 对象。但实际只保存 `serialize()` 里列出的：
+
+```text
+m_serializedKVData
+m_lastRequestId
+```
+
+```cpp
+m_serializedKVData.clear();
+```
+
+清空临时字段，避免它长期占内存或让人误以为它是业务状态。
+
+```cpp
+return ss.str();
+```
+
+返回 snapshot 字符串。
+
+一句话：**把 SkipList 数据 + 客户端去重表打包成一个字符串。**
+
+---
+
+##### 3) `parseFromString()`：从 snapshot 恢复 KVServer 状态（kvServer.h 123-129）
+
+```cpp
+void parseFromString(const std::string &str) {
+```
+
+参数 `str` 是之前 `getSnapshotData()` 生成的 snapshot 字符串。
+
+```cpp
+std::stringstream ss(str);
+```
+
+把字符串包装成输入流。
+
+```cpp
+boost::archive::text_iarchive ia(ss);
+```
+
+创建文本输入归档器。
+
+```cpp
+ia >> *this;
+```
+
+反序列化当前对象。实际恢复的是：
+
+```text
+m_serializedKVData
+m_lastRequestId
+```
+
+```cpp
+m_skipList.load_file(m_serializedKVData);
+```
+
+把 `m_serializedKVData` 里的 KV 数据重新加载到 SkipList。
+
+```cpp
+m_serializedKVData.clear();
+```
+
+清理临时字段。
+
+一句话：**把 snapshot 字符串拆开，恢复 SkipList 和客户端去重表。**
+
+---
+
+##### 4) `ifRequestDuplicate()`：客户端去重表如何判断重复请求（kvServer.cpp 200-207）
+
+```cpp
+bool KvServer::ifRequestDuplicate(std::string ClientId, int RequestId) {
+```
+
+传入客户端 id 和请求序号。
+
+```cpp
+std::lock_guard<std::mutex> lg(m_mtx);
+```
+
+加锁保护 `m_lastRequestId`。
+
+```cpp
+if (m_lastRequestId.find(ClientId) == m_lastRequestId.end()) {
+  return false;
+}
+```
+
+如果从没见过这个客户端，说明不是重复请求。
+
+```cpp
+return RequestId <= m_lastRequestId[ClientId];
+```
+
+如果这次请求 id 小于等于已处理过的最大 id，说明是重复请求。
+
+例子：
+
+```text
+m_lastRequestId["clientA"] = 7
+
+RequestId = 8 -> 新请求
+RequestId = 7 -> 重复请求
+RequestId = 6 -> 旧请求
+```
+
+为什么这个表要同步到不同 server？因为客户端可能重试到另一个 server。如果别的 server 不知道这个请求已执行过，就可能重复执行。同步方式不是单独同步表，而是：
+
+```text
+请求 Op 通过 Raft 日志复制到各节点
+各节点按相同顺序 apply
+apply 时更新 m_lastRequestId
+snapshot 时把 m_lastRequestId 一起保存/传输
+```
+
+所以客户端去重表是状态机状态的一部分。
+
+---
+
+##### 5) `GetCommandFromRaft()`：处理一条 Raft 已提交的普通命令（kvServer.cpp 166-198）
+
+```cpp
+Op op;
+op.parseFromString(message.Command);
+```
+
+Raft 日志里的 command 是字符串，这里解析回 `Op`。
+
+`Op` 包含：
+
+```text
+Operation：Get / Put / Append
+Key
+Value
+ClientId
+RequestId
+```
+
+```cpp
+if (message.CommandIndex <= m_lastSnapShotRaftLogIndex) {
+  return;
+}
+```
+
+如果这条日志已经被当前安装的 snapshot 覆盖，就不要再执行，避免重复 apply。
+
+`m_lastSnapShotRaftLogIndex` 的含义：
+
+```text
+KVServer 已安装的最后一个 snapshot 覆盖到了哪个 Raft log index。
+```
+
+```cpp
+if (!ifRequestDuplicate(op.ClientId, op.RequestId)) {
+```
+
+如果不是重复请求，才真正执行状态机命令。
+
+```cpp
+if (op.Operation == "Put") {
+  ExecutePutOpOnKVDB(op);
+}
+if (op.Operation == "Append") {
+  ExecuteAppendOpOnKVDB(op);
+}
+```
+
+Put/Append 会写 SkipList，并更新 `m_lastRequestId`。
+
+注意：当前代码没有在这里执行 Get，因为 Get 请求在等待 Raft commit 后，会在 `KvServer::Get()` 的 RPC 线程里再读状态机。
+
+```cpp
+if (m_maxRaftState != -1) {
+  IfNeedToSendSnapShotCommand(message.CommandIndex, 9);
+}
+```
+
+每 apply 一条命令后，检查 Raft 持久化状态是否过大。过大就生成 snapshot。
+
+```cpp
+SendMessageToWaitChan(op, message.CommandIndex);
+```
+
+通知正在等待这个 `raftIndex` 的客户端 RPC 线程：你等的日志已经 apply 了，可以检查结果并回复客户端了。
+
+---
+
+##### 6) `SendMessageToWaitChan()`：唤醒等待 Raft 提交结果的 RPC 线程（kvServer.cpp 324-340）
+
+先理解问题：客户端 RPC 线程调用 `Raft::Start()` 后不能立刻返回 OK，因为日志还没 commit。
+
+所以它会创建一个等待队列：
+
+```cpp
+waitApplyCh[raftIndex] = new LockQueue<Op>();
+```
+
+这个队列可以理解成：
+
+```text
+raftIndex 这条日志的“门铃”。
+```
+
+RPC 线程会阻塞等待：
+
+```cpp
+chForRaftIndex->timeOutPop(CONSENSUS_TIMEOUT, &raftCommitOp)
+```
+
+等 Raft apply 线程来叫醒它。
+
+函数本身：
+
+```cpp
+bool KvServer::SendMessageToWaitChan(const Op &op, int raftIndex) {
+```
+
+传入已经 apply 的命令和它所在的 Raft index。
+
+```cpp
+std::lock_guard<std::mutex> lg(m_mtx);
+```
+
+加锁保护 `waitApplyCh`。
+
+```cpp
+if (waitApplyCh.find(raftIndex) == waitApplyCh.end()) {
+  return false;
+}
+```
+
+如果没有线程在等这个 index，就不需要通知。
+
+```cpp
+waitApplyCh[raftIndex]->Push(op);
+```
+
+把已 apply 的命令推入对应队列，唤醒等待中的 RPC 线程。
+
+为什么 RPC 线程醒来后还要检查 `ClientId / RequestId`？
+
+因为 Leader 可能失效，原来预测的 `raftIndex` 可能被新 Leader 的其他日志覆盖。必须确认：
+
+```text
+最终 commit 在这个 index 上的，确实是我的请求。
+```
+
+---
+
+##### 7) `ReadRaftApplyCommandLoop()`：KVServer 的 apply 收件箱（kvServer.cpp 281-297）
+
+```cpp
+void KvServer::ReadRaftApplyCommandLoop() {
+  while (true) {
+```
+
+这是一个后台死循环。它一直等待 Raft 给 KvServer 发消息。
+
+```cpp
+auto message = applyChan->Pop();
+```
+
+从 `applyChan` 阻塞读取一条 `ApplyMsg`。没有消息时线程会停在这里等待。
+
+`applyChan` 可以理解成：
+
+```text
+Raft -> KvServer 的通知队列。
+```
+
+Raft 在 `applierTicker()` 中把已 commit 的普通日志推入这里；`InstallSnapshot()` 也会把 snapshot 消息推入这里。
+
+```cpp
+if (message.CommandValid) {
+  GetCommandFromRaft(message);
+}
+```
+
+如果是普通日志，就交给 `GetCommandFromRaft()` 处理。
+
+```cpp
+if (message.SnapshotValid) {
+  GetSnapShotFromRaft(message);
+}
+```
+
+如果是快照，就交给 `GetSnapShotFromRaft()` 处理。
+
+为什么不一个函数全做完？
+
+```text
+ReadRaftApplyCommandLoop：负责收消息和分发。
+GetCommandFromRaft：负责处理普通命令。
+GetSnapShotFromRaft：负责处理快照。
+```
+
+这不是重复，而是职责分离。
+
+---
+
+##### 8) `IfNeedToSendSnapShotCommand()`：判断是否需要生成 snapshot（kvServer.cpp 342-348）
+
+```cpp
+void KvServer::IfNeedToSendSnapShotCommand(int raftIndex, int proportion) {
+```
+
+`raftIndex` 是当前 apply 的日志 index。`proportion` 当前没有被使用。
+
+```cpp
+if (m_raftNode->GetRaftStateSize() > m_maxRaftState / 10.0) {
+```
+
+如果 Raft 状态过大，就触发 snapshot。
+
+这里 `m_maxRaftState / 10.0` 比较奇怪。函数明明传了 `proportion`，但代码写死了 `/ 10.0`。
+
+```cpp
+auto snapshot = MakeSnapShot();
+```
+
+生成 KVServer 状态机快照。
+
+```cpp
+m_raftNode->Snapshot(raftIndex, snapshot);
+```
+
+把 snapshot 交给 Raft。Raft 会更新 snapshot 边界、截断日志，并通过 `Persister` 同时保存 raft state 和 snapshot data。
+
+---
+
+##### 9) `MakeSnapShot()`：生成状态机快照（kvServer.cpp 359-363）
+
+```cpp
+std::string KvServer::MakeSnapShot() {
+```
+
+返回当前状态机快照字符串。
+
+```cpp
+std::lock_guard<std::mutex> lg(m_mtx);
+```
+
+加锁。因为生成快照时不能让 SkipList 或去重表被并发修改。
+
+```cpp
+std::string snapshotData = getSnapshotData();
+```
+
+调用头文件里的序列化函数，把 SkipList 数据和去重表打包。
+
+```cpp
+return snapshotData;
+```
+
+返回 snapshot 字符串。
+
+---
+
+##### 10) `GetSnapShotFromRaft()`：处理 Raft 推来的 snapshot 消息（kvServer.cpp 350-357）
+
+```cpp
+std::lock_guard<std::mutex> lg(m_mtx);
+```
+
+加锁，因为安装 snapshot 会改 SkipList、去重表、snapshot index。
+
+```cpp
+if (m_raftNode->CondInstallSnapshot(message.SnapshotTerm, message.SnapshotIndex, message.Snapshot)) {
+```
+
+询问 Raft：这个 snapshot 是否还应该安装。
+
+当前项目里 `CondInstallSnapshot()` 直接返回 true，所以基本总会安装。这是待完善点。
+
+```cpp
+ReadSnapShotToInstall(message.Snapshot);
+```
+
+真正解析 snapshot，恢复状态机。
+
+```cpp
+m_lastSnapShotRaftLogIndex = message.SnapshotIndex;
+```
+
+记录已经安装的 snapshot 覆盖到哪个 Raft index。后续普通日志 apply 时，如果 `CommandIndex <= 这个值`，就跳过。
+
+---
+
+##### 11) `ReadSnapShotToInstall()`：安装 snapshot 内容（kvServer.cpp 303-322）
+
+```cpp
+void KvServer::ReadSnapShotToInstall(std::string snapshot) {
+```
+
+参数是 snapshot 字符串。
+
+```cpp
+if (snapshot.empty()) {
+  return;
+}
+```
+
+空 snapshot 直接返回。
+
+```cpp
+parseFromString(snapshot);
+```
+
+真正的实现就在这一行。它会恢复：
+
+```text
+m_lastRequestId
+m_skipList
+```
+
+后面大段注释是原作者参考 6.824 Go 版本留下的伪代码，意思也是：
+
+```text
+从 snapshot 中 decode kvDB 和 lastRequestId
+```
+
+为什么说这个函数“依赖调用方加锁”？因为它内部没有 `lock_guard`，但 `parseFromString()` 会改状态机。现在从 `GetSnapShotFromRaft()` 调用它时，外层已经加锁，所以没事。但如果未来其他地方直接调用它并发安装 snapshot，就可能出问题。
+
+---
+
+##### 12) 构造函数中的 snapshot 恢复（kvServer.cpp 377-450）
+
+```cpp
+std::shared_ptr<Persister> persister = std::make_shared<Persister>(me);
+```
+
+创建当前 server 的持久化器。它会被 KvServer 和 Raft 共用。
+
+```cpp
+m_raftNode = std::make_shared<Raft>();
+```
+
+创建当前 server 内部的 Raft 节点。
+
+```cpp
+m_raftNode->init(servers, m_me, persister, applyChan);
+```
+
+把同一个 `persister` 交给 Raft。Raft 用它恢复 raft state。
+
+```cpp
+m_lastSnapShotRaftLogIndex = 0;
+```
+
+初始化已安装 snapshot 的位置。
+
+```cpp
+auto snapshot = persister->ReadSnapshot();
+```
+
+从磁盘读取 KVServer snapshot。
+
+```cpp
+if (!snapshot.empty()) {
+  ReadSnapShotToInstall(snapshot);
+}
+```
+
+如果有 snapshot，就恢复 SkipList 和去重表。
+
+```cpp
+std::thread t2(&KvServer::ReadRaftApplyCommandLoop, this);
+t2.join();
+```
+
+启动 apply 收件箱循环，后续持续处理 Raft 推来的普通日志和 snapshot。
+
+---
+
+#### Q&A 集
+
+**Q1：不同 server 之间的客户端去重表需要同步吗？怎么同步？**
+
+需要。它不是通过单独 RPC 同步，而是通过 Raft 日志和 snapshot 同步：
+
+```text
+客户端请求 Op 进入 Raft 日志
+  -> 各节点按相同顺序 apply
+  -> 每个节点执行时更新 m_lastRequestId
+  -> snapshot 时把 m_lastRequestId 一起保存/传输
+```
+
+所以去重表是状态机状态的一部分，和 KV 数据一样由 Raft 保证同步。
+
+**Q2：`waitApplyCh` 在客户端代码里还是服务端？**
+
+在服务端，属于 `KvServer` 内部变量：
+
+```cpp
+std::unordered_map<int, LockQueue<Op> *> waitApplyCh;
+```
+
+它协调的是两个服务端线程：
+
+```text
+客户端 RPC 处理线程：等待某个 raftIndex 的结果。
+apply 线程：Raft commit 后唤醒等待者。
+```
+
+**Q3：`SendMessageToWaitChan()` 通知谁？通知干什么？**
+
+通知正在等待某个 `raftIndex` 的 RPC 线程。
+
+`PutAppend()` 调用 `Raft::Start()` 后得到 `raftIndex`，然后阻塞等待。等 Raft 真的 commit/apply 这个 index 后，`GetCommandFromRaft()` 调 `SendMessageToWaitChan()`，把 Op 推入等待队列。RPC 线程醒来后确认是不是自己的请求，然后回复客户端 `OK` 或 `ErrWrongLeader`。
+
+**Q4：为什么 RPC 线程醒来后还要检查 ClientId / RequestId？**
+
+因为 `raftIndex` 只是当前 Leader 本地追加时的位置。Leader 如果中途失效，这个 index 后续可能被其他日志覆盖。必须检查最终 apply 的命令是不是自己提交的那条。
+
+**Q5：`ReadRaftApplyCommandLoop()` 已经读取 apply 命令了，为什么还要 `GetCommandFromRaft()`？**
+
+职责不同：
+
+```text
+ReadRaftApplyCommandLoop：从 applyChan 收消息，判断消息类型。
+GetCommandFromRaft：处理普通日志命令。
+GetSnapShotFromRaft：处理 snapshot 消息。
+```
+
+一个是“收件箱”，一个是“处理普通信件”。
+
+**Q6：`m_lastSnapShotRaftLogIndex` 是怎么避免重复处理旧 apply 消息的？**
+
+安装 snapshot 后：
+
+```cpp
+m_lastSnapShotRaftLogIndex = message.SnapshotIndex;
+```
+
+普通日志 apply 时：
+
+```cpp
+if (message.CommandIndex <= m_lastSnapShotRaftLogIndex) {
+  return;
+}
+```
+
+如果日志 index 已经被 snapshot 覆盖，就跳过。
+
+**Q7：`ar` 到底是什么？**
+
+`ar` 是 Boost.Serialization 传给 `serialize()` 的归档器对象。
+
+- 保存时，它是输出归档器：把字段写出去。
+- 恢复时，它是输入归档器：把字段读回来。
+
+`ar & field` 是 Boost 的统一写法，同一行代码在保存和读取时有不同方向。
+
+**Q8：Persister 是做什么的？**
+
+`Persister` 是底层文件读写器。它不理解 Raft，也不理解 KV，只负责保存两个字符串：
+
+```text
+raftstatePersist<i>.txt：Raft 状态
+snapshotPersist<i>.txt：KVServer 状态机快照
+```
+
+**Q9：Follower 安装 Leader 快照这条链路每个函数做什么？**
+
+```text
+Raft::InstallSnapshot：
+  Follower 的 Raft 接收 Leader 快照，更新快照边界、截断日志、落盘，并向 KvServer 推 ApplyMsg Snapshot。
+
+ReadRaftApplyCommandLoop：
+  KvServer 后台循环，从 applyChan 收到这个 Snapshot 消息。
+
+GetSnapShotFromRaft：
+  判断是否安装，并记录 SnapshotIndex。
+
+ReadSnapShotToInstall：
+  调 parseFromString，恢复 SkipList 和 m_lastRequestId。
+```
+
+**Q10：Append 当前像覆盖，不像追加，是什么意思？**
+
+当前代码：
+
+```cpp
+m_skipList.insert_set_element(op.Key, op.Value);
+```
+
+更像：
+
+```text
+key = value
+```
+
+真正 Append 应该是：
+
+```text
+key = oldValue + value
+```
+
+如果状态机语义错了，snapshot 会把这个“错误的当前状态”保存下来，所以说会被 snapshot 固化。
+
+**Q11：`m_serializedKVData` 只是临时字段却作为成员参与序列化，为什么绕？**
+
+它只是为了把 `m_skipList.dump_file()` 的结果放进 Boost 序列化流程：
+
+```cpp
+m_serializedKVData = m_skipList.dump_file();
+oa << *this;
+```
+
+但它不是长期业务状态。更清楚的设计是单独定义：
+
+```cpp
+struct KvSnapshot {
+  std::string serializedKVData;
+  std::unordered_map<std::string, int> lastRequestId;
+};
+```
+
+然后序列化 `KvSnapshot`，而不是临时污染 `KvServer` 自身成员。
+
+**Q12：`commitIndex` 和 `lastApplied` 为什么不持久化？**
+
+它们是 Raft 的 volatile state。安全性依赖的是持久化的 term、vote、logs、snapshot 边界和 snapshot 数据。重启后：
+
+- `commitIndex` 可由 Leader 的 AppendEntries 重新推进。
+- `lastApplied` 可至少恢复到 snapshotIndex，然后继续 apply 后续 committed 日志。
+
+不过如果存在 snapshot，恢复时把 `commitIndex` 也设置到 snapshotIndex 会更语义一致。
+
+---
+
+#### 可以优化的地方
+
+1. **`Append` 语义疑似错误。**
+
+`ExecuteAppendOpOnKVDB()` 当前调用 `insert_set_element`，行为更像覆盖。应改为读取旧值再拼接新值。
+
+2. **`m_serializedKVData` 作为成员变量参与序列化设计较绕。**
+
+建议引入独立 `KvSnapshot` 结构，专门承载 snapshot 内容。
+
+3. **`ReadSnapShotToInstall()` 内部没有加锁。**
+
+当前依赖 `GetSnapShotFromRaft()` 外层加锁。建议要么在函数内部加锁，要么改名/注释明确“调用方必须持锁”。
+
+4. **`CondInstallSnapshot()` 当前基本空实现。**
+
+它直接返回 true，可能安装不该安装的旧 snapshot。需要补完整判断逻辑。
+
+5. **`IfNeedToSendSnapShotCommand()` 的 `proportion` 参数未使用。**
+
+当前写死 `m_maxRaftState / 10.0`，应改成使用参数或删除参数。
+
+6. **`waitApplyCh` 使用裸指针，手动 new/delete。**
+
+可以改为 `std::shared_ptr<LockQueue<Op>>` 或值语义，降低内存管理风险。
+
+7. **`m_lastSnapShotRaftLogIndex` 未进入 snapshot。**
+
+当前安装 snapshot 后只在内存里记录。是否需要持久化或可由 Raft snapshot metadata 恢复，值得进一步梳理。
+
+8. **`Get` 请求也更新 `m_lastRequestId`，语义需要确认。**
+
+`Get` 是只读操作，是否需要进入去重表，取决于线性一致读的实现策略。当前项目让 Get 也走 Raft，可保证读线性一致，但去重处理要小心。
+
+9. **`ReadRaftApplyCommandLoop()` 两个 if 可以改成 if/else if。**
+
+正常一个 `ApplyMsg` 不应同时既是 Command 又是 Snapshot。当前写两个 if 不一定错，但语义上 `else if` 更明确。
+
+10. **启动恢复顺序要注意 Persister 构造清空文件的问题。**
+
+前面学习过 `Persister` 构造函数会清空持久化文件，这会影响真正的 crash recovery，需要一起优化。
+
+---
+
+#### 一句话总结
+
+> **`KvServer` 的持久化重点不是写文件，而是维护状态机 snapshot：把 SkipList 数据和客户端去重表打包交给 Raft；Raft 负责日志边界和落盘，Persister 负责真正读写文件。`waitApplyCh` 则是服务端内部把“客户端 RPC 等待结果”和“Raft 异步 apply”接起来的通知机制。**
+
+#### 疑问 / TODO
+
+- [ ] 精读 `ExecuteAppendOpOnKVDB()`，确认 Append 语义是否应为旧值拼接新值。
+- [ ] 把 `KvServer` snapshot 改成独立 `KvSnapshot` 结构，替代 `m_serializedKVData` 临时成员。
+- [ ] 给 `ReadSnapShotToInstall()` 增加“调用方必须持锁”注释，或改成内部加锁。
+- [ ] 补全 `Raft::CondInstallSnapshot()`，避免无条件安装 snapshot。
+- [ ] 梳理 Get 是否应该更新 `m_lastRequestId`，以及重复 Get 的返回值是否需要缓存。
+- [ ] 用 Mermaid 单独画一张 `PutAppend -> waitApplyCh -> applyChan -> SendMessageToWaitChan` 的线程协作图。
