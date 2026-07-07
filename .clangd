@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -I/Users/guoyitao/Project/KVstorageBaseRaft-cpp-2/.clangd-stubs
+Diagnostics:
+  UnusedIncludes: Strict

@@ -1,0 +1,12 @@
+-std=c++20
+-I./src/common/include
+-I./src/fiber/include
+-I./src/rpc/include
+-I./example
+-I./src/raftCore/include
+-I./src/raftRpcPro/include
+-I./src/raftClerk/include
+-I./src/skipList/include
+-I./test/include
+-I/opt/homebrew/include
+-I/usr/local/include

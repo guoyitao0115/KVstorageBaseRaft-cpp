@@ -8,6 +8,9 @@ project(KVRaftCpp)
 
 
 set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+add_compile_definitions(_XOPEN_SOURCE)
 # 生成debug版本，可以进行gdb调试
 set(CMAKE_BUILD_TYPE "Debug")
 
@@ -26,10 +29,14 @@ include_directories(${PROJECT_SOURCE_DIR}/src/raftCore/include)
 include_directories(${PROJECT_SOURCE_DIR}/src/raftRpcPro/include)
 include_directories(${PROJECT_SOURCE_DIR}/src/raftClerk/include)
 include_directories(${PROJECT_SOURCE_DIR}/src/skipList/include)
+include_directories(SYSTEM /opt/homebrew/include)
+include_directories(SYSTEM /usr/local/include)
 
 
 # 设置项目库文件搜索路径 -L
 link_directories(${PROJECT_SOURCE_DIR}/lib)
+link_directories(/opt/homebrew/lib)
+link_directories(/usr/local/lib)
 
 # src包含了所有的相关代码
 add_subdirectory(src)

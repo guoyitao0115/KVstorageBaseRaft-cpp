@@ -1,0 +1,22 @@
+{
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/src/common/include",
+    "${workspaceFolder}/src/fiber/include",
+    "${workspaceFolder}/src/rpc/include",
+    "${workspaceFolder}/example",
+    "${workspaceFolder}/src/raftCore/include",
+    "${workspaceFolder}/src/raftRpcPro/include",
+    "${workspaceFolder}/src/raftClerk/include",
+    "${workspaceFolder}/src/skipList/include",
+    "${workspaceFolder}/test/include",
+    "/opt/homebrew/include",
+    "/usr/local/include"
+  ],
+  "clangd.arguments": ["--background-index"],
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json",
+  "cmake.configureSettings": {
+    "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+  }
+}

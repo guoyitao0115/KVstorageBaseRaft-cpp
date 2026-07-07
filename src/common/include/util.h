@@ -52,7 +52,7 @@ std::string format(const char* format_str, Args... args) {
     return std::string(buf.data(), buf.data() + size - 1);  // remove '\0'
 }
 
-std::chrono::_V2::system_clock::time_point now();
+std::chrono::system_clock::time_point now();
 
 std::chrono::milliseconds getRandomizedElectionTimeout();
 void sleepNMilliseconds(int N);

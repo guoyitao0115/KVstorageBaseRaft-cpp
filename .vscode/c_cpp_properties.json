@@ -1,0 +1,24 @@
+{
+  "configurations": [
+    {
+      "name": "macOS",
+      "compilerPath": "/usr/bin/clang++",
+      "cppStandard": "c++20",
+      "intelliSenseMode": "macos-clang-arm64",
+      "includePath": [
+        "${workspaceFolder}/src/common/include",
+        "${workspaceFolder}/src/fiber/include",
+        "${workspaceFolder}/src/rpc/include",
+        "${workspaceFolder}/example",
+        "${workspaceFolder}/src/raftCore/include",
+        "${workspaceFolder}/src/raftRpcPro/include",
+        "${workspaceFolder}/src/raftClerk/include",
+        "${workspaceFolder}/src/skipList/include",
+        "${workspaceFolder}/test/include",
+        "/opt/homebrew/include",
+        "/usr/local/include"
+      ]
+    }
+  ],
+  "version": 4
+}
